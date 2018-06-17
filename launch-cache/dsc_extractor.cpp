@@ -53,6 +53,8 @@
 #include <unordered_map>
 #include <algorithm>
 #include <dispatch/dispatch.h>
+#include <string>
+#include <mach/mach.h>
 
 struct seg_info
 {
@@ -104,6 +106,28 @@ private:
 	}
 	const std::set<int> &_reexportDeps;
 };
+
+template <typename A>
+int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const void* mapped_cache) {
+	typedef typename A::P P;
+	auto cacheBase = ((uint64_t)mh->getSegment("__TEXT")->vmaddr()) - textOffsetInCache;
+	const macho_section<P>* methnameSec = mh->getSection("__TEXT", "__objc_methname");
+	// method name to in-memory address
+	std::unordered_map<std::string, uint64_t> methnameToAddr;
+	for (uint64_t off = 0; off < methnameSec->size();) {
+		const char* methname = (const char*)mh + methnameSec->offset() + off;
+		methnameToAddr[methname] = methnameSec->addr() + off;
+		off += strlen(methname) + 1;
+	}
+	const macho_section<P>* selrefsSec = mh->getSection("__DATA", "__objc_selrefs");
+	uint64_t* selrefsArr = (uint64_t*)(((char*)mh) + selrefsSec->offset());
+	for (uint64_t index = 0; index < selrefsSec->size() / sizeof(uint64_t); index++) {
+		const char* origStr = (const char*)mapped_cache + ((selrefsArr[index] & 0xffffffffffffULL) - cacheBase);
+		printf("%p\n", origStr);
+		selrefsArr[index] = methnameToAddr[origStr];
+	}
+	return 0;
+}
 
 
 template <typename A>
@@ -417,6 +441,8 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 	// return new size
 	*newSize = (symtab->stroff()+symtab->strsize()+4095) & (-4096);
 	
+	fixupObjc<A>(mh, textOffsetInCache, mapped_cache);
+	
 	// <rdar://problem/17671438> Xcode 6 leaks in dyld_shared_cache_extract_dylibs
 	for (std::vector<mach_o::trie::Entry>::iterator it = exports.begin(); it != exports.end(); ++it) {
 		::free((void*)(it->name));
@@ -549,10 +575,20 @@ int dyld_shared_cache_extract_dylibs_progress(const char* shared_cache_file_path
 		fprintf(stderr, "Error: failed to open shared cache file at %s\n", shared_cache_file_path);
 		return -1;
 	}
+	if (fcntl(cache_fd, F_NOCACHE, 1) == -1) {
+		fprintf(stderr, "nocache failed\n");
+		return -1;
+	}
 	
-	void* mapped_cache = mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, cache_fd, 0);
-	if (mapped_cache == MAP_FAILED) {
+	void* mapped_cache = nullptr;
+	// mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE | MAP_NOCACHE, cache_fd, 0);
+	//if (mapped_cache == MAP_FAILED) {
+	if ( vm_allocate(mach_task_self(), (vm_address_t*)(&mapped_cache), statbuf.st_size, VM_FLAGS_ANYWHERE | VM_FLAGS_NO_CACHE) != KERN_SUCCESS ) {
 		fprintf(stderr, "Error: mmap() for shared cache at %s failed, errno=%d\n", shared_cache_file_path, errno);
+		return -1;
+	}
+	if (pread(cache_fd, mapped_cache, statbuf.st_size, 0) <= 0) {
+		fprintf(stderr, "pread failed\n");
 		return -1;
 	}
     
@@ -603,9 +639,11 @@ int dyld_shared_cache_extract_dylibs_progress(const char* shared_cache_file_path
 	__block unsigned        count               = 0;
     
 	for ( NameToSegments::iterator it = map.begin(); it != map.end(); ++it) {
-		fprintf(stderr, "%s\n", it->first);
+		//fprintf(stderr, "%s\n", it->first);
 		//if (strcmp(it->first, "/System/Library/Frameworks/ClassKit.framework/ClassKit") != 0) continue;
-		if (strcmp(it->first, "/System/Library/Frameworks/BusinessChat.framework/Versions/A/BusinessChat") != 0) continue;
+		bool found = strcmp(it->first, "/System/Library/Frameworks/BusinessChat.framework/Versions/A/BusinessChat") == 0;
+		found = found || strcmp(it->first, "/System/Library/Frameworks/BusinessChat.framework/BusinessChat") == 0;
+		if (!found) continue;
 		dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
         dispatch_group_async(group, process_queue, ^{
             
@@ -619,6 +657,7 @@ int dyld_shared_cache_extract_dylibs_progress(const char* shared_cache_file_path
             make_dirs(dylib_path);
             
             // open file, create if does not already exist
+			::unlink(dylib_path);
             int fd = ::open(dylib_path, O_CREAT | O_EXLOCK | O_RDWR, 0644);
             if ( fd == -1 ) {
                 fprintf(stderr, "can't open or create dylib file %s, errnor=%d\n", dylib_path, errno);

@@ -263,6 +263,13 @@
 			remoteGlobalIDString = F99B8E550FEC10F600701838;
 			remoteInfo = dyld_shared_cache_util;
 		};
+		C544002020D6D828005E938A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F9ED4C8B0630A72300DF4E74 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F9D1001114D8D0BA00099D91;
+			remoteInfo = dsc_extractor;
+		};
 		F908134711D3ED1A00626CC1 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = F9ED4C8B0630A72300DF4E74 /* Project object */;
@@ -915,6 +922,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				C544002120D6D828005E938A /* PBXTargetDependency */,
 			);
 			name = dyld_shared_cache_util;
 			productName = dscutil;
@@ -1374,6 +1382,11 @@
 			isa = PBXTargetDependency;
 			target = F99B8E550FEC10F600701838 /* dyld_shared_cache_util */;
 			targetProxy = 37A0AD1A1C16004600731E50 /* PBXContainerItemProxy */;
+		};
+		C544002120D6D828005E938A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F9D1001114D8D0BA00099D91 /* dsc_extractor */;
+			targetProxy = C544002020D6D828005E938A /* PBXContainerItemProxy */;
 		};
 		F908134811D3ED1A00626CC1 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
