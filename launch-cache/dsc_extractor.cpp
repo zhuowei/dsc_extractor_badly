@@ -129,12 +129,14 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 	macho_dysymtab_command<P>*	dynamicSymTab = NULL;
 	macho_linkedit_data_command<P>*	functionStarts = NULL;
 	macho_linkedit_data_command<P>*	dataInCode = NULL;
+	macho_dyld_info_command<P>* dyldInfo = NULL;
 	uint32_t exportsTrieOffset = 0;
 	uint32_t exportsTrieSize = 0;
 	std::set<int> reexportDeps;
 	int depIndex = 0;
 	for (uint32_t i = 0; i < cmdCount; ++i) {
 	    bool remove = false;
+		fprintf(stderr, "Command %x\n", cmd->cmd());
 		switch ( cmd->cmd() ) {
 		case macho_segment_command<P>::CMD:
 			{
@@ -156,9 +158,10 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 		case LC_DYLD_INFO_ONLY:
 			{
 			// zero out all dyld info
-			macho_dyld_info_command<P>* dyldInfo = (macho_dyld_info_command<P>*)cmd;
+			/* macho_dyld_info_command<P>* */ dyldInfo = (macho_dyld_info_command<P>*)cmd;
 			exportsTrieOffset = dyldInfo->export_off();
 			exportsTrieSize = dyldInfo->export_size();
+			/*
 			dyldInfo->set_rebase_off(0);
 			dyldInfo->set_rebase_size(0);
 			dyldInfo->set_bind_off(0);
@@ -169,6 +172,7 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 			dyldInfo->set_lazy_bind_size(0);
 			dyldInfo->set_export_off(0);
 			dyldInfo->set_export_size(0);
+			*/
 			}
 			break;
 		case LC_SYMTAB:
@@ -228,7 +232,32 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 		return -1;
 	}
 
-	const uint64_t newFunctionStartsOffset = linkEditSegCmd->fileoff();
+	if ( dyldInfo == NULL ) {
+		fprintf(stderr, "dyldInfo not found\n");
+		return -1;
+	}
+
+	const uint64_t newDyldInfoOffset = linkEditSegCmd->fileoff();
+	uint64_t newDyldInfoSize = 0;
+
+	memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->rebase_off(), dyldInfo->rebase_size());
+	dyldInfo->set_rebase_off(newDyldInfoOffset + newDyldInfoSize);
+	newDyldInfoSize += dyldInfo->rebase_size();
+
+	memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->bind_off(), dyldInfo->bind_size());
+	dyldInfo->set_bind_off(newDyldInfoOffset + newDyldInfoSize);
+	newDyldInfoSize += dyldInfo->bind_size();
+
+	memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->lazy_bind_off(), dyldInfo->lazy_bind_size());
+	dyldInfo->set_lazy_bind_off(newDyldInfoOffset + newDyldInfoSize);
+	newDyldInfoSize += dyldInfo->lazy_bind_size();
+
+	memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->export_off(), dyldInfo->export_size());
+	dyldInfo->set_export_off(newDyldInfoOffset + newDyldInfoSize);
+
+	newDyldInfoSize += dyldInfo->export_size();
+
+	const uint64_t newFunctionStartsOffset = newDyldInfoOffset + newDyldInfoSize;
 	uint32_t functionStartsSize = 0;
 	if ( functionStarts != NULL ) {
 		// copy function starts from original cache file to new mapped dylib file
@@ -574,6 +603,9 @@ int dyld_shared_cache_extract_dylibs_progress(const char* shared_cache_file_path
 	__block unsigned        count               = 0;
     
 	for ( NameToSegments::iterator it = map.begin(); it != map.end(); ++it) {
+		fprintf(stderr, "%s\n", it->first);
+		//if (strcmp(it->first, "/System/Library/Frameworks/ClassKit.framework/ClassKit") != 0) continue;
+		if (strcmp(it->first, "/System/Library/Frameworks/BusinessChat.framework/Versions/A/BusinessChat") != 0) continue;
 		dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
         dispatch_group_async(group, process_queue, ^{
             
