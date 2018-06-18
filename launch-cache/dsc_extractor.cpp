@@ -236,9 +236,14 @@ int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const
 		printf("%p\n", origStr);
 		selrefsArr[index] = methnameToAddr[origStr];
 	}
+	
+	// oh, and remove the optimized flag
+	const macho_section<P>* objcImageInfoSection = mh->getSection("__DATA", "__objc_imageinfo");
+	uint32_t* objcImageInfo = (uint32_t*)((char*)mh + objcImageInfoSection->offset());
+	objcImageInfo[1] &= ~(1 << 3);
+	
 	return 0;
 }
-
 
 template <typename A>
 int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const void* mapped_cache, uint64_t* newSize) 
@@ -378,6 +383,7 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 	// and generate crappy rebase info
 	std::vector<uint8_t> rebaseInfo = slideOutput<A>(mh, textOffsetInCache, mapped_cache);
 
+	linkEditSegCmd->set_fileoff((linkEditSegCmd->fileoff() + 0xfff) & ~0xfff);
 	const uint64_t newDyldInfoOffset = linkEditSegCmd->fileoff();
 	uint64_t newDyldInfoSize = 0;
 
@@ -559,6 +565,7 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 	
 	// return new size
 	*newSize = (symtab->stroff()+symtab->strsize()+4095) & (-4096);
+	linkEditSegCmd->set_filesize(*newSize - linkEditSegCmd->fileoff());
 	
 	fixupObjc<A>(mh, textOffsetInCache, mapped_cache);
 	
@@ -666,7 +673,8 @@ size_t dylib_maker(const void* mapped_cache, std::vector<uint8_t> &dylib_data, c
 	FA->size                                    = OSSwapHostToBigInt32(totalSize); 
     
 	// optimize linkedit
-	uint64_t                newSize             = dylib_data.size();
+	uint64_t                newSize             = dylib_data.size() + 0x10000;
+	dylib_data.resize(offsetInFatFile+newSize);
 	optimize_linkedit<A>(((macho_header<P>*)(base_ptr+offsetInFatFile)), textOffsetInCache, mapped_cache, &newSize);
 	
 	// update fat header with new file size
