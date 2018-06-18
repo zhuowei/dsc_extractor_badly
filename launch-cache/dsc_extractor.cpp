@@ -107,6 +107,116 @@ private:
 	const std::set<int> &_reexportDeps;
 };
 
+static void append_uleb128(uint64_t value, std::vector<uint8_t>& out) {
+	uint8_t byte;
+	do {
+		byte = value & 0x7F;
+		value &= ~0x7F;
+		if ( value != 0 )
+			byte |= 0x80;
+		out.push_back(byte);
+		value = value >> 7;
+	} while( byte >= 0x80 );
+}
+
+class RebaseMaker {
+public:
+	std::vector<uint8_t> relocs;
+	uintptr_t segmentStartMapped;
+	int32_t currentSegment;
+	RebaseMaker(int32_t _currentSegment, uintptr_t _segmentStartMapped) : currentSegment(_currentSegment), segmentStartMapped(_segmentStartMapped) {
+		relocs.push_back(REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER);
+	}
+	void addSlide(uint8_t* loc) {
+		addReloc(currentSegment, (uintptr_t)loc - segmentStartMapped);
+	}
+	void addReloc(int32_t segment, uintptr_t segmentOffset) {
+		relocs.push_back(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment);
+		append_uleb128(segmentOffset, relocs);
+		relocs.push_back(REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1);
+	}
+	void finish() {
+		relocs.push_back(REBASE_OPCODE_DONE);
+	}
+};
+
+static void rebaseChain(uint8_t* pageContent, uint16_t startOffset, uintptr_t slideAmount, const dyldCacheSlideInfo2<LittleEndian>* slideInfo, RebaseMaker& slides)
+{
+	const uintptr_t   deltaMask    = (uintptr_t)(slideInfo->delta_mask());
+	const uintptr_t   valueMask    = ~deltaMask;
+	const uintptr_t   valueAdd     = (uintptr_t)(slideInfo->value_add());
+	const unsigned	  deltaShift   = __builtin_ctzll(deltaMask) - 2;
+	
+	uint32_t pageOffset = startOffset;
+	uint32_t delta = 1;
+	while ( delta != 0 ) {
+		uint8_t* loc = pageContent + pageOffset;
+		uintptr_t rawValue = *((uintptr_t*)loc);
+		delta = (uint32_t)((rawValue & deltaMask) >> deltaShift);
+		uintptr_t value = (rawValue & valueMask);
+		if ( value != 0 ) {
+			value += valueAdd;
+			value += slideAmount;
+		}
+		*((uintptr_t*)loc) = value;
+		slides.addSlide(loc);
+		//dyld::log("         pageOffset=0x%03X, loc=%p, org value=0x%08llX, new value=0x%08llX, delta=0x%X\n", pageOffset, loc, (uint64_t)rawValue, (uint64_t)value, delta);
+		pageOffset += delta;
+	}
+}
+
+template <typename A>
+std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const void* mapped_cache) {
+	typedef typename A::P P;
+	
+	auto cacheBase = ((uint64_t)mh->getSegment("__TEXT")->vmaddr()) - textOffsetInCache;
+	auto dataSegment = mh->getSegment("__DATA");
+	
+	// grab the slide information from the cache
+	const dyldCacheHeader<LittleEndian>* header = (dyldCacheHeader<LittleEndian>*)mapped_cache;
+	const dyldCacheFileMapping<LittleEndian>* mappings = (dyldCacheFileMapping<LittleEndian>*)((char*)mapped_cache + header->mappingOffset());
+	const dyldCacheFileMapping<LittleEndian>* dataMapping = &mappings[1];
+	uint64_t dataStartAddress = dataMapping->address();	const dyldCacheSlideInfo<LittleEndian>* slideInfo = (dyldCacheSlideInfo<LittleEndian>*)((char*)mapped_cache+header->slideInfoOffset());
+	const dyldCacheSlideInfo2<LittleEndian>* slideHeader = (dyldCacheSlideInfo2<LittleEndian>*)(slideInfo);
+	const uint32_t  page_size = slideHeader->page_size();
+	const uint16_t* page_starts = (uint16_t*)((long)(slideInfo) + slideHeader->page_starts_offset());
+	const uint16_t* page_extras = (uint16_t*)((long)(slideInfo) + slideHeader->page_extras_offset());
+	auto slide = 0;
+	{
+		auto segment = mh->getSegment("__DATA");
+		auto segmentInFile = (uint8_t*)mh + segment->fileoff();
+		RebaseMaker rebaseMaker(1, (uintptr_t)segmentInFile);
+		uint32_t startPage = (segment->vmaddr() - dataStartAddress) / 0x1000;
+		uint32_t endPage = (((segment->vmaddr() + segment->vmsize() + 0xfff) & ~0xfff) - dataStartAddress) / 0x1000;
+		for (int i=startPage; i < endPage; ++i) {
+			uint8_t* page = segmentInFile + ((i - startPage) * 0x1000);
+			uint16_t pageEntry = page_starts[i];
+			//dyld::log("page[%d]: page_starts[i]=0x%04X\n", i, pageEntry);
+			if ( pageEntry == DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE )
+				continue;
+			if ( pageEntry & DYLD_CACHE_SLIDE_PAGE_ATTR_EXTRA ) {
+				uint16_t chainIndex = (pageEntry & 0x3FFF);
+				bool done = false;
+				while ( !done ) {
+					uint16_t info = page_extras[chainIndex];
+					uint16_t pageStartOffset = (info & 0x3FFF)*4;
+					//dyld::log("     chain[%d] pageOffset=0x%03X\n", chainIndex, pageStartOffset);
+					rebaseChain(page, pageStartOffset, slide, slideHeader, rebaseMaker);
+					done = (info & DYLD_CACHE_SLIDE_PAGE_ATTR_END);
+					++chainIndex;
+				}
+			}
+			else {
+				uint32_t pageOffset = pageEntry * 4;
+				//dyld::log("     start pageOffset=0x%03X\n", pageOffset);
+				rebaseChain(page, pageOffset, slide, slideHeader, rebaseMaker);
+			}
+		}
+		rebaseMaker.finish();
+		return rebaseMaker.relocs;
+	}
+}
+
 template <typename A>
 int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const void* mapped_cache) {
 	typedef typename A::P P;
@@ -175,6 +285,9 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 			}
 			if ( strcmp(segCmd->segname(), "__LINKEDIT") == 0 ) {
 				linkEditSegCmd = segCmd;
+			}
+			if ( strcmp(segCmd->segname(), "__DATA") == 0 ) {
+				segCmd->set_vmsize((segCmd->vmsize() + 0xfff) & ~0xfff);
 			}
 			cumulativeFileSize += segCmd->filesize();
 			}
@@ -260,11 +373,17 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 		fprintf(stderr, "dyldInfo not found\n");
 		return -1;
 	}
+	
+	// remove the slide linked list from the dyld cache
+	// and generate crappy rebase info
+	std::vector<uint8_t> rebaseInfo = slideOutput<A>(mh, textOffsetInCache, mapped_cache);
 
 	const uint64_t newDyldInfoOffset = linkEditSegCmd->fileoff();
 	uint64_t newDyldInfoSize = 0;
 
-	memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->rebase_off(), dyldInfo->rebase_size());
+	//memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->rebase_off(), dyldInfo->rebase_size());
+	memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, rebaseInfo.data(), rebaseInfo.size());
+	dyldInfo->set_rebase_size(rebaseInfo.size());
 	dyldInfo->set_rebase_off(newDyldInfoOffset + newDyldInfoSize);
 	newDyldInfoSize += dyldInfo->rebase_size();
 
@@ -447,7 +566,6 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 	for (std::vector<mach_o::trie::Entry>::iterator it = exports.begin(); it != exports.end(); ++it) {
 		::free((void*)(it->name));
 	}
-	
 	
 	return 0;
 }
