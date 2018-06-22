@@ -276,11 +276,10 @@ int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const
 		selrefsArr[index] = methnameToAddr[origStr];
 	}
 	// next, fixup the individual classes
-	
+	auto dataSeg = mh->getSegment("__DATA");
 	auto addrToMyDataMapped = [=](uint64_t addr) {
 		if (addr == 0) return (const char*)nullptr;
-		auto dataSec = mh->getSegment("__DATA");
-		return (const char*)mh + dataSec->fileoff() + (addr - dataSec->vmaddr());
+		return (const char*)mh + dataSeg->fileoff() + (addr - dataSeg->vmaddr());
 	};
 	
 	auto addrToTheirTextMapped = [=](uint64_t addr) {
@@ -309,6 +308,37 @@ int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const
 	uint32_t* objcImageInfo = (uint32_t*)((char*)mh + objcImageInfoSection->offset());
 	objcImageInfo[1] &= ~(1 << 3);
 	
+	// fixup lazy pointers
+	// la_symbol_ptr should point into stub_helper
+	
+	const macho_dyld_info_command<P>* dyldInfo = (const macho_dyld_info_command<P>*)mh->getLoadCommand(LC_DYLD_INFO_ONLY);
+	auto runOneLazyBind = [=](uint32_t cmdOff) {
+		const uint8_t* cmds = (const uint8_t*)mh + dyldInfo->lazy_bind_off() + cmdOff;
+		const uint8_t* cmdsEnd = (const uint8_t*)mh + dyldInfo->lazy_bind_off() + dyldInfo->lazy_bind_size();
+		while (cmds < cmdsEnd) {
+			uint8_t immediate = *cmds & BIND_IMMEDIATE_MASK;
+			uint8_t opcode = *cmds & BIND_OPCODE_MASK;
+			++cmds;
+			switch (opcode) {
+				case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+					return mach_o::trie::read_uleb128(cmds, cmdsEnd);
+			}
+		}
+	};
+	const macho_section<P>* lazyStubSec = mh->getSection("__TEXT", "__stub_helper");
+	// x86_64 specific
+	auto stubStart = 0x10;
+	auto stubSize = 0xa;
+	
+	const uint8_t* lazyStubStart = (const uint8_t*)mh + lazyStubSec->offset();
+	const uint8_t* lazyStubEnd = (const uint8_t*)mh + lazyStubSec->offset() + lazyStubSec->size();
+	for (const uint8_t* lazyStub = lazyStubStart + stubStart; lazyStub < lazyStubEnd; lazyStub += stubSize) {
+		uint32_t offset = *(uint32_t*)(lazyStub + 1); // x86 specific
+		uint64_t stubVMAddr = (uint64_t)(lazyStub - lazyStubStart) + lazyStubSec->addr();
+		uint32_t lazyBindDataOffset = runOneLazyBind(offset);
+		uint64_t* data = (uint64_t*)((uint8_t*)mh + dataSeg->fileoff() + lazyBindDataOffset);
+		*data = stubVMAddr;
+	}
 	return 0;
 }
 
