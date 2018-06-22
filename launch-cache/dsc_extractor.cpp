@@ -176,7 +176,8 @@ std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textO
 	const dyldCacheHeader<LittleEndian>* header = (dyldCacheHeader<LittleEndian>*)mapped_cache;
 	const dyldCacheFileMapping<LittleEndian>* mappings = (dyldCacheFileMapping<LittleEndian>*)((char*)mapped_cache + header->mappingOffset());
 	const dyldCacheFileMapping<LittleEndian>* dataMapping = &mappings[1];
-	uint64_t dataStartAddress = dataMapping->address();	const dyldCacheSlideInfo<LittleEndian>* slideInfo = (dyldCacheSlideInfo<LittleEndian>*)((char*)mapped_cache+header->slideInfoOffset());
+	uint64_t dataStartAddress = dataMapping->address();
+	const dyldCacheSlideInfo<LittleEndian>* slideInfo = (dyldCacheSlideInfo<LittleEndian>*)((char*)mapped_cache+header->slideInfoOffset());
 	const dyldCacheSlideInfo2<LittleEndian>* slideHeader = (dyldCacheSlideInfo2<LittleEndian>*)(slideInfo);
 	const uint32_t  page_size = slideHeader->page_size();
 	const uint16_t* page_starts = (uint16_t*)((long)(slideInfo) + slideHeader->page_starts_offset());
@@ -217,6 +218,44 @@ std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textO
 	}
 }
 
+// copied from ObjC2Abstraction
+
+struct my_objc_object {
+	uint64_t isa;
+};
+
+struct my_objc_class: my_objc_object {
+	uint64_t superclass;
+	uint64_t cache;
+	uint64_t vtable;
+	uint64_t data;
+};
+
+struct my_objc_class_data {
+	uint32_t flags;
+	uint32_t instanceStart;
+	uint32_t instanceSize;
+	uint64_t ivarLayout;
+	uint64_t name;
+	uint64_t baseMethods;
+	uint64_t baseProtocols;
+	uint64_t ivars;
+	uint64_t weakIvarLayout;
+	uint64_t baseProperties;
+};
+
+struct my_objc_method {
+	uint64_t name;
+	uint64_t type;
+	uint64_t imp;
+};
+
+struct my_objc_method_list {
+	uint32_t entsize;
+	uint32_t count;
+	my_objc_method methods[];
+};
+
 template <typename A>
 int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const void* mapped_cache) {
 	typedef typename A::P P;
@@ -236,8 +275,36 @@ int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const
 		printf("%p\n", origStr);
 		selrefsArr[index] = methnameToAddr[origStr];
 	}
+	// next, fixup the individual classes
 	
-	// oh, and remove the optimized flag
+	auto addrToMyDataMapped = [=](uint64_t addr) {
+		if (addr == 0) return (const char*)nullptr;
+		auto dataSec = mh->getSegment("__DATA");
+		return (const char*)mh + dataSec->fileoff() + (addr - dataSec->vmaddr());
+	};
+	
+	auto addrToTheirTextMapped = [=](uint64_t addr) {
+		if (addr == 0) return (const char*)nullptr;
+		return (const char*)mapped_cache + (addr - cacheBase);
+	};
+	
+	const macho_section<P>* classlistSec = mh->getSection("__DATA", "__objc_classlist");
+	uint64_t* classesArr = (uint64_t*)(((char*)mh) + classlistSec->offset());
+	for (uint64_t index = 0; index < classlistSec->size() / sizeof(uint64_t); index++) {
+		my_objc_class* cls = (my_objc_class*)addrToMyDataMapped(classesArr[index]);
+		my_objc_class_data* clsData = (my_objc_class_data*)addrToMyDataMapped(cls->data);
+		if (clsData && clsData->baseMethods) {
+			my_objc_method_list* methodList = (my_objc_method_list*)addrToMyDataMapped(clsData->baseMethods);
+			for (int methIndex = 0; methIndex < methodList->count; methIndex++) {
+				const char* origStr = addrToTheirTextMapped(methodList->methods[methIndex].name);
+				methodList->methods[methIndex].name = methnameToAddr[origStr];
+			}
+			methodList->entsize &= ~3; // clear the optimized flag
+		}
+		// todo: protocols
+	}
+
+	// oh, and remove the optimized flag for the image
 	const macho_section<P>* objcImageInfoSection = mh->getSection("__DATA", "__objc_imageinfo");
 	uint32_t* objcImageInfo = (uint32_t*)((char*)mh + objcImageInfoSection->offset());
 	objcImageInfo[1] &= ~(1 << 3);
