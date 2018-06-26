@@ -265,6 +265,17 @@ struct my_objc_method_list {
 	my_objc_method methods[];
 };
 
+struct seg_info2
+{
+	seg_info2(const char* n, uint64_t o, uint64_t s, uint64_t vm, const void* mh)
+	: segName(n), offset(o), sizem(s), vmaddr(vm), machHeader(mh) { }
+	const char* segName;
+	uint64_t	offset;
+	uint64_t	sizem;
+	uint64_t	vmaddr;
+	const void* machHeader;
+};
+
 template <typename A>
 int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const void* mapped_cache) {
 	typedef typename A::P P;
@@ -388,29 +399,153 @@ int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const
 			return targetAddr;
 		};
 		
+		typedef std::unordered_map<const char*, std::vector<seg_info2>, CStringHash, CStringEquals> NameToSegmentsMore;
+		
+		__block NameToSegmentsMore  map_;
+		__block int	result = dyld_shared_cache_iterate(mapped_cache, 0xC0000000 /* should be big enough */,^(const dyld_shared_cache_dylib_info* dylibInfo, const dyld_shared_cache_segment_info* segInfo) {
+			map_[dylibInfo->path].push_back(seg_info2(segInfo->name, segInfo->fileOffset, segInfo->fileSize, segInfo->address, dylibInfo->machHeader));
+		});
+		NameToSegmentsMore map = map_;
+		
+		std::unordered_map<uint64_t, std::vector<const char*>> addressToSymbolName;
+
+		auto addSymbols = [&](macho_header<P>* mhlib, seg_info2 const& linkeditInfo, seg_info2 const& textInfo) {
+			macho_dyld_info_command<P>* dyldInfoOnly = (macho_dyld_info_command<P>*)mhlib->getLoadCommand(LC_DYLD_INFO_ONLY);
+			
+			std::vector<mach_o::trie::Entry> exports;
+			const uint8_t* exportsStart = ((uint8_t*)mapped_cache) + dyldInfoOnly->export_off();
+			const uint8_t* exportsEnd = exportsStart + dyldInfoOnly->export_size();
+			mach_o::trie::parseTrie(exportsStart, exportsEnd, exports);
+			for (auto& e: exports) {
+				uint64_t address = textInfo.vmaddr + e.address;
+				addressToSymbolName[address].push_back(e.name);
+			}
+		};
+		
+		auto lookupSymbol = [&](uint64_t address) {
+			if (addressToSymbolName.count(address) != 0) {
+				return addressToSymbolName[address];
+			}
+			// lookup the library that contains this address
+			const char* libName = nullptr;
+			for ( auto it = map.begin(); libName == nullptr && it != map.end(); ++it) {
+				for (auto& segInfo : it->second) {
+					if (address >= segInfo.vmaddr && address < segInfo.vmaddr + segInfo.sizem) {
+						// found the library it sits in
+						libName = it->first;
+						break;
+					}
+				}
+			}
+			{
+				seg_info2* textSection = nullptr;
+				seg_info2* linkeditSection = nullptr;
+				for (auto& segInfo : map[libName]) {
+					if (strcmp(segInfo.segName, "__LINKEDIT") == 0) {
+						linkeditSection = &segInfo;
+						break;
+					} else if (strcmp(segInfo.segName, "__TEXT") == 0) {
+						textSection = &segInfo;
+						break;
+					}
+				}
+				addSymbols((macho_header<P>*)textSection->machHeader, *linkeditSection, *textSection);
+			}
+			// ok try again
+			return addressToSymbolName[address];
+		};
+		
+		auto inSomeTextSection = [&](uint64_t address) {
+			for ( auto it = map.begin(); it != map.end(); ++it) {
+				for (auto& segInfo : it->second) {
+					if (strcmp(segInfo.segName, "__TEXT") == 0 && address >= segInfo.vmaddr && address < segInfo.vmaddr + segInfo.sizem) {
+						return true;
+					}
+				}
+			}
+			return false;
+		};
+		
+		auto runOneLazyBindForName = [=](uint32_t cmdOff) {
+			const uint8_t* cmds = (const uint8_t*)mh + dyldInfo->lazy_bind_off() + cmdOff;
+			const uint8_t* cmdsEnd = (const uint8_t*)mh + dyldInfo->lazy_bind_off() + dyldInfo->lazy_bind_size();
+			while (cmds < cmdsEnd) {
+				uint8_t immediate = *cmds & BIND_IMMEDIATE_MASK;
+				uint8_t opcode = *cmds & BIND_OPCODE_MASK;
+				++cmds;
+				switch (opcode) {
+					case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+						mach_o::trie::read_uleb128(cmds, cmdsEnd);
+						break;
+					case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
+						return (const char*)cmds;
+				}
+			}
+			return (const char*)nullptr;
+		};
+		
+		std::unordered_map<std::string, uint64_t> nameToStubAddr;
+		
+		auto stubItSelfSection = mh->getSection("__TEXT", "__stubs");
+		const uint64_t stubItSelfSize = 3 * 4;
+		
+		for (uint32_t stubIndex = 0; stubIndex < stubItSelfSection->size() / stubItSelfSize; stubIndex++ ) {
+			// copied from above
+			const uint8_t* lazyStub = lazyStubStart + stubStart + stubSize * stubIndex;
+			uint32_t offset = *(uint32_t*)(lazyStub + stubAddrOffset);
+			uint64_t stubVMAddr = (uint64_t)(lazyStub - lazyStubStart) + lazyStubSec->addr();
+			const char* name = runOneLazyBindForName(offset);
+			nameToStubAddr[name] = stubItSelfSection->addr() + stubIndex*stubItSelfSize;
+		}
+		for (auto itr = nameToStubAddr.begin(); itr != nameToStubAddr.end(); ++itr) {
+			fprintf(stderr, "%s %p\n", itr->first.c_str(), (void*)itr->second);
+		}
+		
 		const uint8_t* textSectionStart = (const uint8_t*)mh + textSection->offset();
 		const uint8_t* textSectionEnd = (const uint8_t*)mh + textSection->offset() + textSection->size();
-		for (const uint32_t* textPtr = (uint32_t*)textSectionStart; (uint8_t*)textPtr < textSectionEnd; textPtr++) {
+		std::unordered_map<uint64_t, uint64_t> targetAddrToEndAddr;
+		for (uint32_t* textPtr = (uint32_t*)textSectionStart; (uint8_t*)textPtr < textSectionEnd; textPtr++) {
 			uint32_t instruction = *textPtr;
 			uint64_t callSiteAddr = (uint64_t)((const uint8_t*)textPtr - textSectionStart) + textSection->addr();
 			uint64_t targetAddr = getBranch(instruction, callSiteAddr);
 			if (targetAddr == 0 || (targetAddr >= textSeg->vmaddr() && targetAddr < textSeg->vmaddr() + textSeg->vmsize())) {
 				continue;
 			}
-			while (true) {
-				uint32_t* targetInstrPtr = (uint32_t*)addrToTheirTextMapped(targetAddr);
-				uint64_t secondTargetAddr = getBranch(*targetInstrPtr, targetAddr);
-				if (secondTargetAddr == 0) break;
-				targetAddr = secondTargetAddr;
+			if (targetAddrToEndAddr.count(targetAddr) == 0) {
+				auto origTargetAddr = targetAddr;
+				// yes, this is terribly inefficient and slow. But not too slow.
+				while (!inSomeTextSection(targetAddr)) {
+					uint32_t* targetInstrPtr = (uint32_t*)addrToTheirTextMapped(targetAddr);
+					uint64_t secondTargetAddr = getBranch(*targetInstrPtr, targetAddr);
+					if (secondTargetAddr == 0) break;
+					targetAddr = secondTargetAddr;
+				}
+				targetAddrToEndAddr[origTargetAddr] = targetAddr;
+			} else {
+				targetAddr = targetAddrToEndAddr[targetAddr];
 			}
 			// todo: look up the library where targetAddr resides,
 			// find the function's symbol, get its name,
+			auto targetNames = lookupSymbol(targetAddr);
 			// find the same name in our rebase section,
-			// look at sNeverStubEliminateDylibs for how to parse the export table
 			// find its stub,
+			auto stubAddress = 0;
+			for (auto targetName : targetNames) {
+				stubAddress = nameToStubAddr[targetName];
+				if (stubAddress) break;
+				if (strcmp(targetName, "___bzero") == 0) {
+					// hack
+					stubAddress = nameToStubAddr["_bzero"];
+					if (stubAddress) break;
+				}
+			}
+			if (!stubAddress) {
+				abort();
+			}
 			// and finally replace the original jump target with the stub
-			// for now, just print it out
-			fprintf(stderr, "%p: %08x %p\n", (void*)callSiteAddr, instruction, (void*)targetAddr);
+			int64_t deltaToFinalTarget = stubAddress - callSiteAddr;
+			*textPtr = (instruction & 0xFC000000) | ((deltaToFinalTarget >> 2) & 0x03FFFFFF);
+			//fprintf(stderr, "%p: %08x %p %s\n", (void*)callSiteAddr, instruction, (void*)targetAddr, targetName);
 		}
 	}
 	
