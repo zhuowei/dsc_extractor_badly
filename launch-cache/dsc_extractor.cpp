@@ -696,7 +696,7 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 
 	//memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->rebase_off(), dyldInfo->rebase_size());
 	memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, rebaseInfo.data(), rebaseInfo.size());
-	dyldInfo->set_rebase_size(rebaseInfo.size());
+	dyldInfo->set_rebase_size((rebaseInfo.size() + 0x7u) & ~0x7u);
 	dyldInfo->set_rebase_off(newDyldInfoOffset + newDyldInfoSize);
 	newDyldInfoSize += dyldInfo->rebase_size();
 
@@ -742,7 +742,8 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 	uint32_t localNlistCount = 0;
 	const char* localStrings = NULL;
 	const char* localStringsEnd = NULL;
-	if ( header->mappingOffset() > offsetof(dyld_cache_header,localSymbolsSize) ) {
+	bool copyTheLocalSyms = false;
+	if ( copyTheLocalSyms && header->mappingOffset() > offsetof(dyld_cache_header,localSymbolsSize) ) {
 		dyldCacheLocalSymbolsInfo<E>* localInfo = (dyldCacheLocalSymbolsInfo<E>*)(((uint8_t*)mapped_cache) + header->localSymbolsOffset());
 		dyldCacheLocalSymbolEntry<E>* entries = (dyldCacheLocalSymbolEntry<E>*)(((uint8_t*)mapped_cache) + header->localSymbolsOffset() + localInfo->entriesOffset());
 		macho_nlist<P>* allLocalNlists = (macho_nlist<P>*)(((uint8_t*)localInfo) + localInfo->nlistOffset());
@@ -873,6 +874,7 @@ int optimize_linkedit(macho_header<typename A::P>* mh, uint64_t textOffsetInCach
 	// return new size
 	*newSize = (symtab->stroff()+symtab->strsize()+4095) & (-4096);
 	linkEditSegCmd->set_filesize(*newSize - linkEditSegCmd->fileoff());
+	symtab->set_strsize(*newSize - symtab->stroff());
 	
 	fixupObjc<A>(mh, textOffsetInCache, mapped_cache);
 	
