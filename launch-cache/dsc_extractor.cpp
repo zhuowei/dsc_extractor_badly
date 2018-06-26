@@ -369,6 +369,51 @@ int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const
 		uint64_t* data = (uint64_t*)((uint8_t*)mh + dataSeg->fileoff() + lazyBindDataOffset);
 		*data = stubVMAddr;
 	}
+	
+	// arm64: disassemble each function, fix up all the calls to stubs.
+	if (mh->cputype() == CPU_TYPE_ARM64) {
+		auto textSeg = mh->getSegment("__TEXT");
+		auto textSection = mh->getSection("__TEXT", "__text");
+		
+		auto getBranch = [](uint32_t instruction, uint64_t callSiteAddr) {
+			// from optimizeArm64CallSites
+			// skip all but BL or B
+			if ( (instruction & 0x7C000000) != 0x14000000 )
+				return (uint64_t)0;
+			// compute target of branch instruction
+			int32_t brDelta = (instruction & 0x03FFFFFF) << 2;
+			if ( brDelta & 0x08000000 )
+				brDelta |= 0xF0000000;
+			uint64_t targetAddr = callSiteAddr + (int64_t)brDelta;
+			return targetAddr;
+		};
+		
+		const uint8_t* textSectionStart = (const uint8_t*)mh + textSection->offset();
+		const uint8_t* textSectionEnd = (const uint8_t*)mh + textSection->offset() + textSection->size();
+		for (const uint32_t* textPtr = (uint32_t*)textSectionStart; (uint8_t*)textPtr < textSectionEnd; textPtr++) {
+			uint32_t instruction = *textPtr;
+			uint64_t callSiteAddr = (uint64_t)((const uint8_t*)textPtr - textSectionStart) + textSection->addr();
+			uint64_t targetAddr = getBranch(instruction, callSiteAddr);
+			if (targetAddr == 0 || (targetAddr >= textSeg->vmaddr() && targetAddr < textSeg->vmaddr() + textSeg->vmsize())) {
+				continue;
+			}
+			while (true) {
+				uint32_t* targetInstrPtr = (uint32_t*)addrToTheirTextMapped(targetAddr);
+				uint64_t secondTargetAddr = getBranch(*targetInstrPtr, targetAddr);
+				if (secondTargetAddr == 0) break;
+				targetAddr = secondTargetAddr;
+			}
+			// todo: look up the library where targetAddr resides,
+			// find the function's symbol, get its name,
+			// find the same name in our rebase section,
+			// look at sNeverStubEliminateDylibs for how to parse the export table
+			// find its stub,
+			// and finally replace the original jump target with the stub
+			// for now, just print it out
+			fprintf(stderr, "%p: %08x %p\n", (void*)callSiteAddr, instruction, (void*)targetAddr);
+		}
+	}
+	
 	return 0;
 }
 
