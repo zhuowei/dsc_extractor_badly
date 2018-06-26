@@ -182,15 +182,17 @@ std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textO
 	const uint32_t  page_size = slideHeader->page_size();
 	const uint16_t* page_starts = (uint16_t*)((long)(slideInfo) + slideHeader->page_starts_offset());
 	const uint16_t* page_extras = (uint16_t*)((long)(slideInfo) + slideHeader->page_extras_offset());
+	
 	auto slide = 0;
-	{
-		auto segment = mh->getSegment("__DATA");
+	auto slideOneSegment = [=](const macho_segment_command<P>* segment, int segmentIndex) {
 		auto segmentInFile = (uint8_t*)mh + segment->fileoff();
-		RebaseMaker rebaseMaker(1, (uintptr_t)segmentInFile);
-		uint32_t startPage = (segment->vmaddr() - dataStartAddress) / 0x1000;
+		RebaseMaker rebaseMaker(segmentIndex, (uintptr_t)segmentInFile);
+		uint32_t startAddr = segment->vmaddr() - dataStartAddress;
+		uint32_t startPage = startAddr / 0x1000;
+		uint32_t startAddrOff = startAddr & 0xfff;
 		uint32_t endPage = (((segment->vmaddr() + segment->vmsize() + 0xfff) & ~0xfff) - dataStartAddress) / 0x1000;
 		for (int i=startPage; i < endPage; ++i) {
-			uint8_t* page = segmentInFile + ((i - startPage) * 0x1000);
+			uint8_t* page = segmentInFile + ((i - startPage) * 0x1000) - startAddrOff;
 			uint16_t pageEntry = page_starts[i];
 			//dyld::log("page[%d]: page_starts[i]=0x%04X\n", i, pageEntry);
 			if ( pageEntry == DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE )
@@ -215,7 +217,14 @@ std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textO
 		}
 		rebaseMaker.finish();
 		return rebaseMaker.relocs;
+	};
+	auto ret = slideOneSegment(mh->getSegment("__DATA"), 1);
+	auto constData = mh->getSegment("__DATA_CONST");
+	if (constData) {
+		auto c = slideOneSegment(constData, 2);
+		ret.insert(ret.end(), c.begin(), c.end());
 	}
+	return ret;
 }
 
 // copied from ObjC2Abstraction
@@ -277,8 +286,19 @@ int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const
 	}
 	// next, fixup the individual classes
 	auto dataSeg = mh->getSegment("__DATA");
+	
+	auto dataConstSeg = mh->getSegment("__DATA_CONST");
+	
+	auto addrToMyDataConstMapped = [=](uint64_t addr) {
+		if (addr == 0) return (const char*)nullptr;
+		return (const char*)mh + dataConstSeg->fileoff() + (addr - dataConstSeg->vmaddr());
+	};
+
 	auto addrToMyDataMapped = [=](uint64_t addr) {
 		if (addr == 0) return (const char*)nullptr;
+		if (!(addr >= dataSeg->vmaddr() && addr < dataSeg->vmaddr() + dataSeg->vmsize()) && dataConstSeg) {
+			return addrToMyDataConstMapped(addr);
+		}
 		return (const char*)mh + dataSeg->fileoff() + (addr - dataSeg->vmaddr());
 	};
 	
@@ -327,13 +347,23 @@ int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const
 	};
 	const macho_section<P>* lazyStubSec = mh->getSection("__TEXT", "__stub_helper");
 	// x86_64 specific
-	auto stubStart = 0x10;
-	auto stubSize = 0xa;
+	uint32_t stubStart, stubSize, stubAddrOffset;
+	if (mh->cputype() == CPU_TYPE_X86_64) {
+		stubStart = 0x10;
+		stubSize = 0xa;
+		stubAddrOffset = 0x1;
+	} else if (mh->cputype() == CPU_TYPE_ARM64) {
+		stubStart = 0x18;
+		stubSize = 0xc;
+		stubAddrOffset = 0x8;
+	} else {
+		abort();
+	}
 	
 	const uint8_t* lazyStubStart = (const uint8_t*)mh + lazyStubSec->offset();
 	const uint8_t* lazyStubEnd = (const uint8_t*)mh + lazyStubSec->offset() + lazyStubSec->size();
 	for (const uint8_t* lazyStub = lazyStubStart + stubStart; lazyStub < lazyStubEnd; lazyStub += stubSize) {
-		uint32_t offset = *(uint32_t*)(lazyStub + 1); // x86 specific
+		uint32_t offset = *(uint32_t*)(lazyStub + stubAddrOffset);
 		uint64_t stubVMAddr = (uint64_t)(lazyStub - lazyStubStart) + lazyStubSec->addr();
 		uint32_t lazyBindDataOffset = runOneLazyBind(offset);
 		uint64_t* data = (uint64_t*)((uint8_t*)mh + dataSeg->fileoff() + lazyBindDataOffset);
