@@ -999,6 +999,7 @@ size_t dylib_maker(const void* mapped_cache, std::vector<uint8_t> &dylib_data, c
 int dyld_shared_cache_extract_dylibs_progress(const char* shared_cache_file_path, const char* extraction_root_path,
 													void (^progress)(unsigned current, unsigned total))
 {
+	const bool nocache = false;
 	struct stat statbuf;
 	if (stat(shared_cache_file_path, &statbuf)) {
 		fprintf(stderr, "Error: stat failed for dyld shared cache at %s\n", shared_cache_file_path);
@@ -1010,21 +1011,31 @@ int dyld_shared_cache_extract_dylibs_progress(const char* shared_cache_file_path
 		fprintf(stderr, "Error: failed to open shared cache file at %s\n", shared_cache_file_path);
 		return -1;
 	}
-	if (fcntl(cache_fd, F_NOCACHE, 1) == -1) {
-		fprintf(stderr, "nocache failed\n");
-		return -1;
+	if (nocache) {
+		if (fcntl(cache_fd, F_NOCACHE, 1) == -1) {
+			fprintf(stderr, "nocache failed\n");
+			return -1;
+		}
 	}
 	
 	void* mapped_cache = nullptr;
 	// mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE | MAP_NOCACHE, cache_fd, 0);
 	//if (mapped_cache == MAP_FAILED) {
-	if ( vm_allocate(mach_task_self(), (vm_address_t*)(&mapped_cache), statbuf.st_size, VM_FLAGS_ANYWHERE | VM_FLAGS_NO_CACHE) != KERN_SUCCESS ) {
-		fprintf(stderr, "Error: mmap() for shared cache at %s failed, errno=%d\n", shared_cache_file_path, errno);
-		return -1;
-	}
-	if (pread(cache_fd, mapped_cache, statbuf.st_size, 0) <= 0) {
-		fprintf(stderr, "pread failed\n");
-		return -1;
+	if (nocache) {
+		if ( vm_allocate(mach_task_self(), (vm_address_t*)(&mapped_cache), statbuf.st_size, VM_FLAGS_ANYWHERE | VM_FLAGS_NO_CACHE) != KERN_SUCCESS ) {
+			fprintf(stderr, "Error: mmap() for shared cache at %s failed, errno=%d\n", shared_cache_file_path, errno);
+			return -1;
+		}
+		if (pread(cache_fd, mapped_cache, statbuf.st_size, 0) <= 0) {
+			fprintf(stderr, "pread failed\n");
+			return -1;
+		}
+	} else {
+		mapped_cache = mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, cache_fd, 0);
+		if (mapped_cache == MAP_FAILED) {
+			fprintf(stderr, "Error: mmap() for shared cache at %s failed, errno=%d\n", shared_cache_file_path, errno);
+			return -1;
+		}
 	}
     
     close(cache_fd);
