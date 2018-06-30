@@ -123,12 +123,17 @@ class RebaseMaker {
 public:
 	std::vector<uint8_t> relocs;
 	uintptr_t segmentStartMapped;
+	uintptr_t segmentEndMapped;
 	int32_t currentSegment;
-	RebaseMaker(int32_t _currentSegment, uintptr_t _segmentStartMapped) : currentSegment(_currentSegment), segmentStartMapped(_segmentStartMapped) {
+	RebaseMaker(int32_t _currentSegment, uintptr_t _segmentStartMapped, uintptr_t _segmentEndMapped) : currentSegment(_currentSegment), segmentStartMapped(_segmentStartMapped), segmentEndMapped(_segmentEndMapped) {
 		relocs.push_back(REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER);
 	}
 	void addSlide(uint8_t* loc) {
-		addReloc(currentSegment, (uintptr_t)loc - segmentStartMapped);
+		uintptr_t l = (uintptr_t)loc;
+		if (l < segmentStartMapped || l >= segmentEndMapped) {
+			return;
+		}
+		addReloc(currentSegment, l - segmentStartMapped);
 	}
 	void addReloc(int32_t segment, uintptr_t segmentOffset) {
 		relocs.push_back(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment);
@@ -186,7 +191,7 @@ std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textO
 	auto slide = 0;
 	auto slideOneSegment = [=](const macho_segment_command<P>* segment, int segmentIndex) {
 		auto segmentInFile = (uint8_t*)mh + segment->fileoff();
-		RebaseMaker rebaseMaker(segmentIndex, (uintptr_t)segmentInFile);
+		RebaseMaker rebaseMaker(segmentIndex, (uintptr_t)segmentInFile, (uintptr_t)(segmentInFile + segment->filesize()));
 		uint32_t startAddr = segment->vmaddr() - dataStartAddress;
 		uint32_t startPage = startAddr / 0x1000;
 		uint32_t startAddrOff = startAddr & 0xfff;
