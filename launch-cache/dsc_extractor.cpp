@@ -222,7 +222,7 @@ std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textO
 	auto constData = mh->getSegment("__DATA_CONST");
 	if (constData) {
 		auto c = slideOneSegment(constData, 2);
-		ret.insert(ret.end(), c.begin(), c.end());
+		ret.insert(ret.end() - 1, c.begin(), c.end());
 	}
 	return ret;
 }
