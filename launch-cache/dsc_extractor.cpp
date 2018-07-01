@@ -131,6 +131,7 @@ public:
 	void addSlide(uint8_t* loc) {
 		uintptr_t l = (uintptr_t)loc;
 		if (l < segmentStartMapped || l >= segmentEndMapped) {
+			abort();
 			return;
 		}
 		addReloc(currentSegment, l - segmentStartMapped);
@@ -145,7 +146,7 @@ public:
 	}
 };
 
-static void rebaseChain(uint8_t* pageContent, uint16_t startOffset, uintptr_t slideAmount, const dyldCacheSlideInfo2<LittleEndian>* slideInfo, RebaseMaker& slides)
+static void rebaseChain(uint8_t* pageContent, uint16_t startOffset, uintptr_t slideAmount, const dyldCacheSlideInfo2<LittleEndian>* slideInfo, uint8_t* filePage, uint8_t* segmentStart, uint8_t* segmentEnd, RebaseMaker& slides)
 {
 	const uintptr_t   deltaMask    = (uintptr_t)(slideInfo->delta_mask());
 	const uintptr_t   valueMask    = ~deltaMask;
@@ -163,8 +164,15 @@ static void rebaseChain(uint8_t* pageContent, uint16_t startOffset, uintptr_t sl
 			value += valueAdd;
 			value += slideAmount;
 		}
-		*((uintptr_t*)loc) = value;
-		slides.addSlide(loc);
+		//*((uintptr_t*)loc) = value;
+		uint8_t* outLoc = filePage + pageOffset;
+		if (outLoc >= segmentStart && outLoc < segmentEnd) {
+			if (*((uintptr_t*)outLoc) != rawValue) {
+				abort();
+			}
+			*((uintptr_t*)outLoc) = value;
+			slides.addSlide(outLoc);
+		}
 		//dyld::log("         pageOffset=0x%03X, loc=%p, org value=0x%08llX, new value=0x%08llX, delta=0x%X\n", pageOffset, loc, (uint64_t)rawValue, (uint64_t)value, delta);
 		pageOffset += delta;
 	}
@@ -192,12 +200,14 @@ std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textO
 	auto slideOneSegment = [=](const macho_segment_command<P>* segment, int segmentIndex) {
 		auto segmentInFile = (uint8_t*)mh + segment->fileoff();
 		RebaseMaker rebaseMaker(segmentIndex, (uintptr_t)segmentInFile, (uintptr_t)(segmentInFile + segment->filesize()));
-		uint32_t startAddr = segment->vmaddr() - dataStartAddress;
+		uint64_t startAddr = segment->vmaddr() - dataStartAddress;
 		uint32_t startPage = startAddr / 0x1000;
 		uint32_t startAddrOff = startAddr & 0xfff;
-		uint32_t endPage = (((segment->vmaddr() + segment->vmsize() + 0xfff) & ~0xfff) - dataStartAddress) / 0x1000;
+		uint32_t endPage = (((segment->vmaddr() + segment->vmsize() + 0xfffull) & ~0xfffull) - dataStartAddress) / 0x1000;
+		auto segmentEnd = segmentInFile + segment->filesize();
 		for (int i=startPage; i < endPage; ++i) {
-			uint8_t* page = segmentInFile + ((i - startPage) * 0x1000) - startAddrOff;
+			uint8_t* filePage = segmentInFile + ((i - startPage) * 0x1000) - startAddrOff;
+			uint8_t* page = (uint8_t*)mapped_cache + dataMapping->file_offset() + (i * 0x1000);
 			uint16_t pageEntry = page_starts[i];
 			//dyld::log("page[%d]: page_starts[i]=0x%04X\n", i, pageEntry);
 			if ( pageEntry == DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE )
@@ -209,7 +219,7 @@ std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textO
 					uint16_t info = page_extras[chainIndex];
 					uint16_t pageStartOffset = (info & 0x3FFF)*4;
 					//dyld::log("     chain[%d] pageOffset=0x%03X\n", chainIndex, pageStartOffset);
-					rebaseChain(page, pageStartOffset, slide, slideHeader, rebaseMaker);
+					rebaseChain(page, pageStartOffset, slide, slideHeader, filePage, segmentInFile, segmentEnd, rebaseMaker);
 					done = (info & DYLD_CACHE_SLIDE_PAGE_ATTR_END);
 					++chainIndex;
 				}
@@ -217,7 +227,7 @@ std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textO
 			else {
 				uint32_t pageOffset = pageEntry * 4;
 				//dyld::log("     start pageOffset=0x%03X\n", pageOffset);
-				rebaseChain(page, pageOffset, slide, slideHeader, rebaseMaker);
+				rebaseChain(page, pageOffset, slide, slideHeader, filePage, segmentInFile, segmentEnd, rebaseMaker);
 			}
 		}
 		rebaseMaker.finish();
