@@ -303,12 +303,15 @@ int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const
 		methnameToAddr[methname] = methnameSec->addr() + off;
 		off += strlen(methname) + 1;
 	}
+	std::unordered_map<uint64_t, uint64_t> unfixedSelectorToFixedIndex;
 	const macho_section<P>* selrefsSec = mh->getSection("__DATA", "__objc_selrefs");
 	uint64_t* selrefsArr = (uint64_t*)(((char*)mh) + selrefsSec->offset());
 	for (uint64_t index = 0; index < selrefsSec->size() / sizeof(uint64_t); index++) {
+		uint64_t origSel = selrefsArr[index];
 		const char* origStr = (const char*)mapped_cache + ((selrefsArr[index] & 0xffffffffffffULL) - cacheBase);
 		printf("%p\n", origStr);
 		selrefsArr[index] = methnameToAddr[origStr];
+		unfixedSelectorToFixedIndex[origSel] = index;
 	}
 	// next, fixup the individual classes
 	auto dataSeg = mh->getSegment("__DATA");
@@ -522,6 +525,33 @@ int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const
 		for (uint32_t* textPtr = (uint32_t*)textSectionStart; (uint8_t*)textPtr < textSectionEnd; textPtr++) {
 			uint32_t instruction = *textPtr;
 			uint64_t callSiteAddr = (uint64_t)((const uint8_t*)textPtr - textSectionStart) + textSection->addr();
+			if ((instruction & 0xff000000u) == 0x91000000) {
+				// add
+				uint32_t& prevInstruction = *(textPtr - 1);
+				if ((prevInstruction & 0x9f000000u) == 0x90000000) {
+					// adrp
+					uint32_t destAdrpR = prevInstruction & 0x1f;
+					uint32_t srcAddR = (instruction >> 5) & 0x1f;
+					if (destAdrpR == srcAddR) {
+						// ok is this a selector?
+						uint64_t adrpImm = (((prevInstruction >> 5) & 0x7ffff) << 2) | ((prevInstruction >> 29) & 0x3);
+						uint64_t adrpAddr = (callSiteAddr - 4 + (adrpImm << 12)) & ~0xfffull;
+						uint64_t addImm = ((instruction >> 10) & 0xfff) << ((instruction >> 22) & 0x3);
+						uint64_t ptrAddr = adrpAddr + addImm;
+						const char* pointedTo = addrToTheirTextMapped(ptrAddr);
+						// debugger?
+						if (unfixedSelectorToFixedIndex.count(ptrAddr) == 1) {
+							// found a selector, switch the adrp/add to adrp/ldr, point to the selector's address in the table
+							// from AdjustForNewSegmentLocation.cpp
+							uint64_t targetAddress = selrefsSec->addr() + unfixedSelectorToFixedIndex[ptrAddr] * sizeof(uint64_t);
+							int64_t pageDistance = targetAddress - ((callSiteAddr - 4) & ~0xfff);
+							int64_t newPage21 = pageDistance >> 12;
+							prevInstruction = (prevInstruction & 0x9F00001F) | ((newPage21 << 29) & 0x60000000) | ((newPage21 << 3) & 0x00FFFFE0);
+							*textPtr = (instruction & 0x3ff) | 0xf9400000 | (((pageDistance & 0xfff) >> 3) << 10);
+						}
+					}
+				}
+			}
 			uint64_t targetAddr = getBranch(instruction, callSiteAddr);
 			if (targetAddr == 0 || (targetAddr >= textSeg->vmaddr() && targetAddr < textSeg->vmaddr() + textSeg->vmsize())) {
 				continue;
